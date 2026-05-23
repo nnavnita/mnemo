@@ -99,6 +99,17 @@ type Exporter struct {
 	path    string
 	syncMu  sync.Mutex
 	syncing bool
+
+	// resolveLayout returns the active vault layout mode (v1/both/v2)
+	// at sync time. Nil → resolved as VaultLayoutBoth (the safest
+	// default — preserves existing v1 writers while populating the
+	// new _mnemo/ wing). SetLayoutResolver swaps in a live resolver
+	// from the registry, which reads the daemon's current config.
+	resolveLayout func() string
+
+	// resolveSoakWarnAfter returns the configured "both"-layout soak
+	// window. Nil → defaultVaultSoakWarnAfter (720h / 30 days).
+	resolveSoakWarnAfter func() time.Duration
 }
 
 // New creates a new Exporter rooted at path. The directory is created if
@@ -113,6 +124,131 @@ func New(backend store.Backend, path string) (*Exporter, error) {
 
 // Path returns the vault root directory.
 func (e *Exporter) Path() string { return e.path }
+
+// SetLayoutResolver swaps in a function the exporter calls at sync
+// time to learn the active vault_layout mode. The registry passes a
+// closure over its live Config so a hot-reload change to vault_layout
+// takes effect on the next sync without rebuilding the exporter.
+//
+// A nil resolver (the default) is treated as VaultLayoutBoth — the
+// conservative choice that keeps the v1 path active until layout is
+// explicitly set.
+func (e *Exporter) SetLayoutResolver(fn func() string) {
+	e.resolveLayout = fn
+}
+
+// SetSoakWarnAfterResolver swaps in a function the exporter calls at
+// sync time to learn the soak window for the "both" warning. Nil
+// leaves the default (720h) in effect.
+func (e *Exporter) SetSoakWarnAfterResolver(fn func() time.Duration) {
+	e.resolveSoakWarnAfter = fn
+}
+
+// soakWarnCadence is how often the daemon re-emits the
+// "vault_layout=both past soak window" warning once the initial trip
+// has fired. Weekly cadence per the design.
+const soakWarnCadence = 7 * 24 * time.Hour
+
+// maintainStateAndWarn updates ~/.mnemo/state.json for the active
+// layout and emits the soak-window warning when due. Designed as a
+// best-effort sidecar: any error is logged and execution continues so
+// state-file trouble never blocks a vault sync.
+//
+// Rules:
+//   - If state.VaultPath differs from this exporter's path, reset the
+//     layout counters (the recorded soak time belonged to the previous
+//     vault and has no meaning against the new one) and re-record
+//     state.VaultPath.
+//   - Record first-seen for the active layout if not already present.
+//   - When layout == "both" and hours_in_both >= soak window, emit a
+//     structured warning if no prior warning has fired or the last one
+//     was >= soakWarnCadence ago. Persist the warn timestamp.
+//
+// Soak window: pulled from the same Config the layout resolver reads.
+// We approximate by loading state regardless of resolver and reusing
+// the default soak constant when no Config is available — the
+// resolver path always provides one in practice.
+func (e *Exporter) maintainStateAndWarn(layout string) {
+	state, err := store.LoadState()
+	if err != nil {
+		slog.Warn("vault: load state.json failed", "err", err)
+		return
+	}
+
+	if state.VaultPath != e.path {
+		state.ResetLayoutCounters()
+		state.VaultPath = e.path
+	}
+
+	now := time.Now().UTC()
+	changed := state.RecordLayoutFirstSeen(layout, now)
+	// Bookkeeping field updates we want to persist whether or not the
+	// first-seen entry was new — VaultPath above may have been reset.
+	changed = changed || state.VaultPath == e.path
+
+	if layout == store.VaultLayoutBoth {
+		t := state.LayoutFirstSeen(store.VaultLayoutBoth)
+		if t != nil {
+			hoursInBoth := time.Since(*t) / time.Hour
+			soakAfter := e.soakWarnAfter()
+			if hoursInBoth >= soakAfter/time.Hour {
+				if state.VaultLayoutLastSoakWarn == nil ||
+					now.Sub(*state.VaultLayoutLastSoakWarn) >= soakWarnCadence {
+					days := int64((time.Since(*t) + 12*time.Hour) / (24 * time.Hour))
+					slog.Warn(`vault_layout="both" past soak window — opt into "v2" or run mnemo_vault_gc_legacy to finish migrating`,
+						"days_in_both", days,
+						"soak_warn_after", soakAfter,
+						"vault_path", e.path)
+					nowCopy := now
+					state.VaultLayoutLastSoakWarn = &nowCopy
+					changed = true
+				}
+			}
+		}
+	}
+
+	if !changed {
+		return
+	}
+	if err := store.WriteState(state); err != nil {
+		slog.Warn("vault: write state.json failed", "err", err)
+	}
+}
+
+// soakWarnAfter returns the configured soak window. Resolved through
+// a closure the registry installs (resolveSoakWarnAfter); nil falls
+// back to the package default so the package remains testable without
+// a full Config.
+func (e *Exporter) soakWarnAfter() time.Duration {
+	if e.resolveSoakWarnAfter == nil {
+		return defaultVaultSoakWarnAfter
+	}
+	d := e.resolveSoakWarnAfter()
+	if d <= 0 {
+		return defaultVaultSoakWarnAfter
+	}
+	return d
+}
+
+// defaultVaultSoakWarnAfter mirrors store.defaultVaultLayoutSoakWarnAfter
+// (kept duplicated rather than exported to avoid widening the store
+// API for one constant; tests pin both values).
+const defaultVaultSoakWarnAfter = 720 * time.Hour
+
+// activeLayout returns the resolved layout mode for this sync, or
+// VaultLayoutBoth when no resolver is configured (safe default).
+func (e *Exporter) activeLayout() string {
+	if e.resolveLayout == nil {
+		return store.VaultLayoutBoth
+	}
+	mode := e.resolveLayout()
+	switch mode {
+	case store.VaultLayoutV2, store.VaultLayoutBoth, store.VaultLayoutV1:
+		return mode
+	default:
+		return store.VaultLayoutBoth
+	}
+}
 
 // Sync performs a full vault synchronisation: sessions, decisions, memories,
 // plans, targets, CI runs, PRs, per-repo indices, and the root index.
@@ -140,34 +276,51 @@ func (e *Exporter) Sync(ctx context.Context) error {
 		e.syncMu.Unlock()
 	}()
 
-	slog.Info("vault: sync starting", "path", e.path)
+	layout := e.activeLayout()
+	slog.Info("vault: sync starting", "path", e.path, "layout", layout)
 	start := time.Now()
 
-	// Sessions must be synced first: the path map they produce is needed
-	// by decisions (for back-links) and repo indices (for forward-links).
-	sessionPaths, err := e.syncSessions(ctx)
+	// State.json bookkeeping (🎯T64.2): record first-seen for the
+	// active layout so the soak-TTL counter can age, and emit the
+	// weekly warning when "both" sits past the soak window. Failures
+	// here are non-fatal: they log and proceed so a state.json
+	// problem does not block the actual vault write.
+	e.maintainStateAndWarn(layout)
+
 	var firstErr error
 	setErr := func(e error) {
 		if e != nil && firstErr == nil {
 			firstErr = e
 		}
 	}
-	setErr(err)
-	setErr(e.syncDecisions(ctx, sessionPaths))
-	setErr(e.syncMemories(ctx))
-	setErr(e.syncPlans(ctx))
-	setErr(e.syncTargets(ctx))
-	setErr(e.syncCI(ctx))
-	setErr(e.syncPRs(ctx))
-	setErr(e.syncSkills(ctx))
-	setErr(e.syncConfigs(ctx))
-	// Repo indices and root index are written last so they reflect the
-	// session paths already materialised above. Fetch repos once and
-	// pass to both so we avoid two identical ListRepos queries.
-	repos, err := e.backend.ListRepos("")
-	setErr(err)
-	setErr(e.syncRepoIndices(ctx, repos, sessionPaths))
-	setErr(e.syncRootIndex(repos))
+
+	// _mnemo/ namespace (🎯T64.2). Written under v2 and both; skipped
+	// under pure v1 (the wing does not exist in that layout). Runs
+	// first so the wing exists before any subsequent slice tries to
+	// write _mnemo/<collection>/ pages.
+	if layout != store.VaultLayoutV1 {
+		setErr(e.syncMnemoNamespace())
+	}
+
+	// v1 root-level writers (sessions/, decisions/, ...). Skipped
+	// under pure v2; run under v1 and both. Sessions go first because
+	// the path map is needed by decisions and repo indices.
+	if layout != store.VaultLayoutV2 {
+		sessionPaths, err := e.syncSessions(ctx)
+		setErr(err)
+		setErr(e.syncDecisions(ctx, sessionPaths))
+		setErr(e.syncMemories(ctx))
+		setErr(e.syncPlans(ctx))
+		setErr(e.syncTargets(ctx))
+		setErr(e.syncCI(ctx))
+		setErr(e.syncPRs(ctx))
+		setErr(e.syncSkills(ctx))
+		setErr(e.syncConfigs(ctx))
+		repos, err := e.backend.ListRepos("")
+		setErr(err)
+		setErr(e.syncRepoIndices(ctx, repos, sessionPaths))
+		setErr(e.syncRootIndex(repos))
+	}
 
 	slog.Info("vault: sync complete",
 		"elapsed", time.Since(start).Round(time.Millisecond),

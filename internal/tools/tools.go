@@ -32,6 +32,8 @@ import (
 type VaultSyncer interface {
 	Sync(ctx context.Context) error
 	Path() string
+	MigrationDocSnapshot() string
+	WriteMigrationDoc() (string, error)
 }
 
 // CompactorHealthReporter is satisfied by *compact.Watcher.
@@ -601,7 +603,19 @@ Human content added below the <!-- mnemo:generated --> fence in any vault note i
 Vault must be configured via vault_path in ~/.mnemo/config.json.`),
 		),
 		mcp.NewTool("mnemo_vault_status",
-			mcp.WithDescription("Report vault configuration: whether vault is enabled, the vault root path, the active indexing scope (vault_indexing_scope) with its includes and .mnemoignore file state, and a count of notes on disk by section."),
+			mcp.WithDescription("Report vault configuration: whether vault is enabled, the vault root path, the active indexing scope (vault_indexing_scope) with its includes and .mnemoignore file state, the resolved vault_layout (v1/both/v2) with soak counter and migration recommendation, and a count of notes on disk by section."),
+		),
+		mcp.NewTool("mnemo_vault_migration_doc",
+			mcp.WithDescription(`Return or rewrite the v1→v2 layout MIGRATION.md snapshot.
+
+Modes:
+  - write=false (default): return the current state-of-vault snapshot as text without touching the filesystem. Use this to inspect what would be written without persisting.
+  - write=true: idempotently render the snapshot to <vault>/_mnemo/MIGRATION.md, overwriting any existing file. Use this to restore the doc after deleting it, or to refresh it after the v1 layout state changes.
+
+MIGRATION.md is normally write-once: mnemo creates it the first sync that observes a v1 layout and never regenerates it. Deleting it tells mnemo "I have read this; move on." This tool is the user-initiated escape hatch when you want the doc back.
+
+Requires vault_path to be configured.`),
+			mcp.WithBoolean("write", mcp.Description("If true, persist the snapshot to <vault>/_mnemo/MIGRATION.md. Default: false (snapshot only).")),
 		),
 		mcp.NewTool("mnemo_compactor_status",
 			mcp.WithDescription(`Report the live state of mnemo's background session compactor (🎯T67). Returns:
@@ -781,6 +795,8 @@ func (h *Handler) Call(ctx context.Context, cc CallContext, name string, args ma
 		return ch.sourceDrift()
 	case "mnemo_vault_gc":
 		return ch.vaultGC(args)
+	case "mnemo_vault_migration_doc":
+		return ch.vaultMigrationDoc(args)
 	case "mnemo_config":
 		return ch.config(args, h.cfgCtl)
 	default:
@@ -2309,6 +2325,30 @@ func (h *callHandler) vaultStatus(ctl ConfigController) (string, bool, error) {
 	}
 	fmt.Fprintf(&b, "  ignore_file: %s (%s)\n\n", ignoreFile, ignoreState)
 
+	// Vault layout (🎯T64.2). Surfaces the resolved mode, soak counter
+	// (days_in_both), and recommendation per the design's state
+	// machine so the user can audit whether a "both" vault is still
+	// within its migration window.
+	layout := cfg.ResolvedVaultLayout(vaultPath)
+	b.WriteString("Layout:\n")
+	fmt.Fprintf(&b, "  mode:        %s", layout)
+	if cfg.VaultLayout.Mode == "" {
+		b.WriteString("  (auto-default)")
+	}
+	b.WriteString("\n")
+
+	state, _ := store.LoadState()
+	soakAfter, _ := cfg.VaultLayout.EffectiveSoakWarnAfter()
+	hoursInBoth, daysInBoth := computeHoursInBoth(state, layout)
+	if layout == store.VaultLayoutBoth {
+		fmt.Fprintf(&b, "  days_in_both: %d (soak_warn_after: %s)\n", daysInBoth, soakAfter)
+	}
+	rec := vaultLayoutRecommendation(layout, vaultPath, hoursInBoth, soakAfter)
+	if rec != "" {
+		fmt.Fprintf(&b, "  recommendation: %s\n", rec)
+	}
+	b.WriteString("\n")
+
 	b.WriteString("Notes on disk:\n")
 	total := 0
 	for _, sec := range sections {
@@ -2531,6 +2571,85 @@ func (h *callHandler) vaultGC(args map[string]any) (string, bool, error) {
 	return b.String(), false, nil
 }
 
+// vaultMigrationDoc implements mnemo_vault_migration_doc. The default
+// (write: false) returns the current state-of-vault snapshot without
+// touching the filesystem; write: true overwrites _mnemo/MIGRATION.md
+// with the same content, returning the path written to.
+func (h *callHandler) vaultMigrationDoc(args map[string]any) (string, bool, error) {
+	if h.vault == nil {
+		return vaultNotConfigured, false, nil
+	}
+	write, _ := args["write"].(bool)
+	if !write {
+		return h.vault.MigrationDocSnapshot(), false, nil
+	}
+	path, err := h.vault.WriteMigrationDoc()
+	if err != nil {
+		return fmt.Sprintf("write migration doc failed: %v", err), true, nil
+	}
+	return fmt.Sprintf("wrote %s", path), false, nil
+}
+
+// computeHoursInBoth returns (hours, days) elapsed since the daemon
+// first observed layout="both" for the current vault, or (0, 0) when
+// the current resolved layout is not "both" or no first-seen entry
+// has been recorded yet.
+func computeHoursInBoth(state store.State, layout string) (hours, days int64) {
+	if layout != store.VaultLayoutBoth {
+		return 0, 0
+	}
+	t := state.LayoutFirstSeen(store.VaultLayoutBoth)
+	if t == nil {
+		return 0, 0
+	}
+	delta := time.Since(*t)
+	if delta < 0 {
+		return 0, 0
+	}
+	h := int64(delta / time.Hour)
+	d := int64((delta + 12*time.Hour) / (24 * time.Hour))
+	return h, d
+}
+
+// vaultLayoutRecommendation implements the state machine from
+// docs/design/vault-library-wing.md. Pure function of observable
+// state, so the recommendation always matches what the user sees.
+//
+// Returns "" (empty) when no migration action is owed.
+func vaultLayoutRecommendation(layout, vaultPath string, hoursInBoth int64, soakAfter time.Duration) string {
+	soakAfterHours := int64(soakAfter / time.Hour)
+	switch layout {
+	case store.VaultLayoutBoth:
+		if hoursInBoth >= soakAfterHours {
+			return "opt into v2"
+		}
+		return "still within soak"
+	case store.VaultLayoutV2:
+		if hasV1MarkerDirs(vaultPath) {
+			return "run gc_legacy"
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+
+// hasV1MarkerDirs reports whether any of the v1 root-level marker
+// directories (sessions/, decisions/, ...) exist under vaultPath.
+// Used by the recommendation state machine and by the migration-doc
+// snapshotter.
+func hasV1MarkerDirs(vaultPath string) bool {
+	for _, d := range []string{
+		"sessions", "decisions", "memories", "skills", "configs",
+		"plans", "targets", "ci", "prs", "repos",
+	} {
+		if fi, err := os.Stat(filepath.Join(vaultPath, d)); err == nil && fi.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 // countMDFiles counts *.md files recursively under dir.
 func countMDFiles(dir string) int {
 	count := 0
@@ -2614,6 +2733,7 @@ var knownConfigKeys = map[string]struct{}{
 	"vault_indexing_scope":       {},
 	"vault_indexing_includes":    {},
 	"vault_indexing_ignore_file": {},
+	"vault_layout":               {},
 	"linked_instances":           {},
 }
 

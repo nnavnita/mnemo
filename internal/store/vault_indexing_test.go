@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestResolvedVaultIndexingScopeExplicit(t *testing.T) {
@@ -140,6 +141,69 @@ func TestResolveVaultIndexingRoots(t *testing.T) {
 				if got[i] != c.want[i] {
 					t.Errorf("roots[%d]: got %q want %q", i, got[i], c.want[i])
 				}
+			}
+		})
+	}
+}
+
+// 🎯T64.2 — vault_layout resolution defaults and explicit override.
+func TestResolvedVaultLayoutExplicit(t *testing.T) {
+	for _, want := range []string{VaultLayoutV2, VaultLayoutBoth, VaultLayoutV1} {
+		t.Run(want, func(t *testing.T) {
+			cfg := Config{VaultLayout: VaultLayoutConfig{Mode: want}}
+			if got := cfg.ResolvedVaultLayout(t.TempDir()); got != want {
+				t.Errorf("explicit layout %q lost: got %q", want, got)
+			}
+		})
+	}
+}
+
+func TestResolvedVaultLayoutDefaultsNewVault(t *testing.T) {
+	cfg := Config{}
+	if got := cfg.ResolvedVaultLayout(t.TempDir()); got != VaultLayoutV2 {
+		t.Errorf("empty vault should default to %q, got %q", VaultLayoutV2, got)
+	}
+}
+
+func TestResolvedVaultLayoutDefaultsV1Vault(t *testing.T) {
+	vault := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vault, "sessions"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{}
+	if got := cfg.ResolvedVaultLayout(vault); got != VaultLayoutBoth {
+		t.Errorf("v1 vault should default to %q for migration continuity, got %q",
+			VaultLayoutBoth, got)
+	}
+}
+
+func TestVaultLayoutEffectiveSoakWarnAfter(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"default", "", defaultVaultLayoutSoakWarnAfter, false},
+		{"valid", "168h", 168 * time.Hour, false},
+		{"malformed", "thirty days", 0, true},
+		{"negative", "-1h", 0, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			lc := VaultLayoutConfig{SoakWarnAfter: c.in}
+			got, err := lc.EffectiveSoakWarnAfter()
+			if c.wantErr {
+				if err == nil {
+					t.Errorf("expected error for %q, got %v", c.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %v want %v", got, c.want)
 			}
 		})
 	}

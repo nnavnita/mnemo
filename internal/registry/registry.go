@@ -169,6 +169,17 @@ func (r *Registry) ForUser(username string) (*store.Store, error) {
 		if err != nil {
 			slog.Warn("vault: exporter creation failed", "path", vaultPath, "err", err)
 		} else {
+			vp := vaultPath
+			exp.SetLayoutResolver(func() string {
+				return r.CurrentConfig().ResolvedVaultLayout(vp)
+			})
+			exp.SetSoakWarnAfterResolver(func() time.Duration {
+				d, err := r.CurrentConfig().VaultLayout.EffectiveSoakWarnAfter()
+				if err != nil {
+					return 0
+				}
+				return d
+			})
 			vaultExp = exp
 		}
 	}
@@ -810,6 +821,16 @@ func (r *Registry) swapVault(username string, e *userEntry, newPath string) erro
 		return fmt.Errorf("vault.New(%q): %w", newPath, err)
 	}
 	e.store.SetVaultPath(newPath) // 🎯T68.6 mirror new vault path for divergence + GC
+	exp.SetLayoutResolver(func() string {
+		return r.CurrentConfig().ResolvedVaultLayout(newPath)
+	})
+	exp.SetSoakWarnAfterResolver(func() time.Duration {
+		d, err := r.CurrentConfig().VaultLayout.EffectiveSoakWarnAfter()
+		if err != nil {
+			return 0
+		}
+		return d
+	})
 	r.mu.Lock()
 	e.vault = exp
 	vctx := r.startVaultWorkers(username, e)

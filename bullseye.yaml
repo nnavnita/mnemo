@@ -1769,7 +1769,7 @@ targets:
     achieved: 2026-05-23
   T64.2:
     name: '`_mnemo/` namespace + vault_layout config'
-    status: identified
+    status: achieved
     value: 2.0
     cost: 0.0
     acceptance:
@@ -1784,6 +1784,7 @@ targets:
     - T64.1
     origin: PR
     discovered: 2026-05-22
+    achieved: 2026-05-24
   T64.3:
     name: Move decisions + memories under _mnemo/
     status: identified

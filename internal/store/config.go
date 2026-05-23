@@ -84,6 +84,13 @@ type Config struct {
 	// consulted — nested .mnemoignore files are not honoured.
 	VaultIndexingIgnoreFile string `json:"vault_indexing_ignore_file,omitempty"`
 
+	// VaultLayout controls which directory tree(s) the vault exporter
+	// writes (🎯T64.2). The zero value resolves at runtime via
+	// ResolvedVaultLayout against the live vault: a vault with any
+	// root-level v1 marker dir (sessions/, decisions/, ...) defaults to
+	// "both" for migration continuity, anything else defaults to "v2".
+	VaultLayout VaultLayoutConfig `json:"vault_layout,omitempty"`
+
 	// LinkedInstances declares peer mnemo endpoints to federate with
 	// (🎯T15). Each peer is identified by a https URL and a trusted
 	// peer certificate (either a name resolved under ~/.mnemo/peers/
@@ -621,6 +628,80 @@ const (
 	VaultIndexingScopeFull      = "full"
 	VaultIndexingScopeIncludes  = "includes"
 )
+
+// Vault layout constants. v2 writes only to <vault>/_mnemo/; v1 writes
+// only to the root-level v1 dirs (sessions/, decisions/, ...); both
+// writes to both trees during a migration window.
+const (
+	VaultLayoutV2   = "v2"
+	VaultLayoutBoth = "both"
+	VaultLayoutV1   = "v1"
+)
+
+// defaultVaultLayoutSoakWarnAfter is the soak window after which a
+// vault stuck on layout="both" begins emitting a structured warning on
+// each sync (weekly cadence once tripped). 720h = 30 days. The user
+// can lengthen via VaultLayoutConfig.SoakWarnAfter.
+const defaultVaultLayoutSoakWarnAfter = 720 * time.Hour
+
+// VaultLayoutConfig governs which vault tree(s) the exporter writes.
+// Modelled as a struct (rather than a bare string) so the soak-warn
+// window can be tuned alongside the mode without inventing a sibling
+// top-level config key.
+type VaultLayoutConfig struct {
+	// Mode is one of VaultLayoutV2, VaultLayoutBoth, VaultLayoutV1, or
+	// empty. Empty resolves at runtime per ResolvedVaultLayout.
+	Mode string `json:"mode,omitempty"`
+
+	// SoakWarnAfter is a Go time.ParseDuration string controlling when
+	// the daemon begins warning about a vault stuck on Mode == "both".
+	// Empty defaults to 720h (30 days). Only consulted while Mode
+	// resolves to "both"; ignored otherwise.
+	SoakWarnAfter string `json:"soak_warn_after,omitempty"`
+}
+
+// EffectiveSoakWarnAfter parses SoakWarnAfter and returns the duration,
+// or defaultVaultLayoutSoakWarnAfter when unset. A malformed value
+// surfaces as an error so config validation can flag it at write time.
+func (l VaultLayoutConfig) EffectiveSoakWarnAfter() (time.Duration, error) {
+	if l.SoakWarnAfter == "" {
+		return defaultVaultLayoutSoakWarnAfter, nil
+	}
+	d, err := time.ParseDuration(l.SoakWarnAfter)
+	if err != nil {
+		return 0, fmt.Errorf("vault_layout.soak_warn_after: %w", err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("vault_layout.soak_warn_after must be positive, got %v", d)
+	}
+	return d, nil
+}
+
+// ResolvedVaultLayout returns the effective layout mode for the vault
+// at resolvedVaultPath. When VaultLayout.Mode is set explicitly, it
+// wins (after type-check). Otherwise:
+//
+//   - any v1 marker dir present (sessions/, decisions/, ...) → "both"
+//     (migration continuity — keep writing v1 while user opts in to v2)
+//   - otherwise (new or already-v2 vault)                   → "v2"
+//
+// An empty resolvedVaultPath returns "v2" — the call site is
+// responsible for not invoking the exporter when vault is disabled.
+func (c Config) ResolvedVaultLayout(resolvedVaultPath string) string {
+	switch c.VaultLayout.Mode {
+	case VaultLayoutV2, VaultLayoutBoth, VaultLayoutV1:
+		return c.VaultLayout.Mode
+	}
+	if resolvedVaultPath == "" {
+		return VaultLayoutV2
+	}
+	for _, d := range v1VaultMarkerDirs {
+		if fi, err := os.Stat(filepath.Join(resolvedVaultPath, d)); err == nil && fi.IsDir() {
+			return VaultLayoutBoth
+		}
+	}
+	return VaultLayoutV2
+}
 
 // defaultVaultIgnoreFile is the conventional name of the gitignore-
 // syntax exclude file at the vault root.
