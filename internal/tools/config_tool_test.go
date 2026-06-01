@@ -152,3 +152,35 @@ func TestConfigToolNoControllerAvailable(t *testing.T) {
 		t.Errorf("expected error when controller not wired")
 	}
 }
+
+// TestConfigToolWriteRejectsMalformedSoakWarnAfter ensures the
+// mnemo_config write path surfaces a malformed vault_layout
+// configuration synchronously instead of letting it fall through to
+// the resolver, where it would have silently degraded to the package
+// default. The user sees the error at write time, not as a vanished
+// override on next sync.
+func TestConfigToolWriteRejectsMalformedSoakWarnAfter(t *testing.T) {
+	ctl := &fakeCtl{cur: store.Config{}}
+	ch := &callHandler{}
+	out, isErr, err := ch.config(map[string]any{
+		"op": "write",
+		"patch": map[string]any{
+			"vault_layout": map[string]any{
+				"mode":            "both",
+				"soak_warn_after": "thirty days",
+			},
+		},
+	}, ctl)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !isErr {
+		t.Errorf("expected tool-level error for malformed soak_warn_after, got: %s", out)
+	}
+	if !strings.Contains(out, "soak_warn_after") {
+		t.Errorf("error should mention soak_warn_after, got: %s", out)
+	}
+	if ctl.last.VaultLayout.SoakWarnAfter != "" {
+		t.Errorf("controller should not have received the bad config; got %q", ctl.last.VaultLayout.SoakWarnAfter)
+	}
+}

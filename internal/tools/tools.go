@@ -2639,10 +2639,7 @@ func vaultLayoutRecommendation(layout, vaultPath string, hoursInBoth int64, soak
 // Used by the recommendation state machine and by the migration-doc
 // snapshotter.
 func hasV1MarkerDirs(vaultPath string) bool {
-	for _, d := range []string{
-		"sessions", "decisions", "memories", "skills", "configs",
-		"plans", "targets", "ci", "prs", "repos",
-	} {
+	for _, d := range store.V1VaultMarkerDirs {
 		if fi, err := os.Stat(filepath.Join(vaultPath, d)); err == nil && fi.IsDir() {
 			return true
 		}
@@ -2692,6 +2689,9 @@ func (h *callHandler) config(args map[string]any, ctl ConfigController) (string,
 		current := ctl.Get()
 		merged, err := mergeConfigPatch(current, patch)
 		if err != nil {
+			return fmt.Sprintf("patch invalid: %v", err), true, nil
+		}
+		if _, err := merged.VaultLayout.EffectiveSoakWarnAfter(); err != nil {
 			return fmt.Sprintf("patch invalid: %v", err), true, nil
 		}
 		report, err := ctl.Put(merged)

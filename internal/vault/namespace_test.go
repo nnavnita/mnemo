@@ -256,6 +256,117 @@ func TestVaultPathChangeResetsCounters(t *testing.T) {
 	}
 }
 
+// TestNoOpSyncDoesNotRewriteState verifies that a sync against a
+// vault whose state is already current does not rewrite state.json.
+// Regression for the maintainStateAndWarn bug where the `changed`
+// flag was unconditionally true after the VaultPath assignment,
+// triggering an atomic state-file write on every sync.
+func TestNoOpSyncDoesNotRewriteState(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "mnemo-noop-state-")
+	defer os.RemoveAll(dir)
+	restore := store.SetStateDirForTesting(dir)
+	defer restore()
+
+	_, exp := newVaultForTest(t)
+	// v2 layout: no root-level v1 dirs get written, no MIGRATION.md
+	// gating runs. The only state.json writer in this path is
+	// maintainStateAndWarn, which is exactly what the regression
+	// targets.
+	exp.SetLayoutResolver(func() string { return store.VaultLayoutV2 })
+
+	if err := exp.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync 1: %v", err)
+	}
+	statePath := filepath.Join(dir, "state.json")
+
+	// Backdate the file so any rewrite is detectable by mtime.
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(statePath, past, past); err != nil {
+		t.Fatal(err)
+	}
+	stat1, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatalf("stat state.json: %v", err)
+	}
+
+	if err := exp.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync 2: %v", err)
+	}
+	stat2, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatalf("stat state.json after second sync: %v", err)
+	}
+	if !stat1.ModTime().Equal(stat2.ModTime()) {
+		t.Errorf("state.json rewritten on no-op sync; mtime moved %v → %v",
+			stat1.ModTime(), stat2.ModTime())
+	}
+}
+
+// TestMigrationDocStateClearedFileExists verifies that an existing
+// MIGRATION.md on disk is honoured as already-written even when
+// state.json was cleared (e.g. wiped manually, or a prior state-write
+// failed). The on-disk file is the load-bearing source of truth for
+// the write-once contract; state.json is a hint.
+func TestMigrationDocStateClearedFileExists(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "mnemo-migclear-state-")
+	defer os.RemoveAll(dir)
+	restore := store.SetStateDirForTesting(dir)
+	defer restore()
+
+	vaultDir, exp := newVaultForTest(t)
+	exp.SetLayoutResolver(func() string { return store.VaultLayoutBoth })
+
+	if err := os.MkdirAll(filepath.Join(vaultDir, "sessions"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Manually plant a MIGRATION.md with a sentinel payload to ensure
+	// the syncer does not overwrite it.
+	wingDir := filepath.Join(vaultDir, mnemoNamespaceDir)
+	if err := os.MkdirAll(wingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	migPath := filepath.Join(wingDir, migrationDocName)
+	sentinel := []byte("USER-EDITED MIGRATION CONTENT\n")
+	if err := os.WriteFile(migPath, sentinel, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Leave state.json empty: VaultMigrationDocWritten is false.
+	if err := exp.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	got, err := os.ReadFile(migPath)
+	if err != nil {
+		t.Fatalf("MIGRATION.md missing: %v", err)
+	}
+	if string(got) != string(sentinel) {
+		t.Errorf("MIGRATION.md clobbered; got %q, want %q", got, sentinel)
+	}
+
+	// Flag should have been back-filled from the on-disk file so the
+	// next sync sees a consistent view.
+	s, _ := store.LoadState()
+	if !s.VaultMigrationDocWritten {
+		t.Error("VaultMigrationDocWritten was not pinned after on-disk detection")
+	}
+}
+
+// TestSoakWarnAfterDefaultFromStore pins this package's fallback to
+// the exported store constant so the two cannot silently drift. With
+// the constant inlined, a change in store would not break this test;
+// referencing store.DefaultVaultLayoutSoakWarnAfter directly makes a
+// future re-introduction of a local copy fail at compile time.
+func TestSoakWarnAfterDefaultFromStore(t *testing.T) {
+	_, exp := newVaultForTest(t)
+	got := exp.soakWarnAfter()
+	if got != store.DefaultVaultLayoutSoakWarnAfter {
+		t.Errorf("soakWarnAfter default = %v, want store.DefaultVaultLayoutSoakWarnAfter = %v",
+			got, store.DefaultVaultLayoutSoakWarnAfter)
+	}
+}
+
 // newVaultForTest builds an Exporter against a fresh temp store and
 // vault dir. No layout resolver is set — callers configure their own.
 func newVaultForTest(t *testing.T) (string, *Exporter) {

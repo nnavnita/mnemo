@@ -638,11 +638,15 @@ const (
 	VaultLayoutV1   = "v1"
 )
 
-// defaultVaultLayoutSoakWarnAfter is the soak window after which a
+// DefaultVaultLayoutSoakWarnAfter is the soak window after which a
 // vault stuck on layout="both" begins emitting a structured warning on
 // each sync (weekly cadence once tripped). 720h = 30 days. The user
 // can lengthen via VaultLayoutConfig.SoakWarnAfter.
-const defaultVaultLayoutSoakWarnAfter = 720 * time.Hour
+//
+// Exported so the vault package can reference the same value without
+// duplicating the constant (drift would otherwise be silent — neither
+// compilation nor per-package tests would catch it).
+const DefaultVaultLayoutSoakWarnAfter = 720 * time.Hour
 
 // VaultLayoutConfig governs which vault tree(s) the exporter writes.
 // Modelled as a struct (rather than a bare string) so the soak-warn
@@ -661,11 +665,11 @@ type VaultLayoutConfig struct {
 }
 
 // EffectiveSoakWarnAfter parses SoakWarnAfter and returns the duration,
-// or defaultVaultLayoutSoakWarnAfter when unset. A malformed value
+// or DefaultVaultLayoutSoakWarnAfter when unset. A malformed value
 // surfaces as an error so config validation can flag it at write time.
 func (l VaultLayoutConfig) EffectiveSoakWarnAfter() (time.Duration, error) {
 	if l.SoakWarnAfter == "" {
-		return defaultVaultLayoutSoakWarnAfter, nil
+		return DefaultVaultLayoutSoakWarnAfter, nil
 	}
 	d, err := time.ParseDuration(l.SoakWarnAfter)
 	if err != nil {
@@ -695,7 +699,7 @@ func (c Config) ResolvedVaultLayout(resolvedVaultPath string) string {
 	if resolvedVaultPath == "" {
 		return VaultLayoutV2
 	}
-	for _, d := range v1VaultMarkerDirs {
+	for _, d := range V1VaultMarkerDirs {
 		if fi, err := os.Stat(filepath.Join(resolvedVaultPath, d)); err == nil && fi.IsDir() {
 			return VaultLayoutBoth
 		}
@@ -707,11 +711,11 @@ func (c Config) ResolvedVaultLayout(resolvedVaultPath string) string {
 // syntax exclude file at the vault root.
 const defaultVaultIgnoreFile = ".mnemoignore"
 
-// v1VaultMarkerDirs are the root-level subdirectories the v1 vault
+// V1VaultMarkerDirs are the root-level subdirectories the v1 vault
 // layout writes to. The presence of any of these without a sibling
 // `_mnemo/` indicates a pre-Slice 1 vault that should default to
 // "full" indexing scope for continuity.
-var v1VaultMarkerDirs = []string{
+var V1VaultMarkerDirs = []string{
 	"sessions", "decisions", "memories", "skills", "configs",
 	"plans", "targets", "ci", "prs", "repos",
 }
@@ -737,7 +741,7 @@ func (c Config) ResolvedVaultIndexingScope(resolvedVaultPath string) string {
 	if fi, err := os.Stat(filepath.Join(resolvedVaultPath, "_mnemo")); err == nil && fi.IsDir() {
 		return VaultIndexingScopeMnemoOnly
 	}
-	for _, d := range v1VaultMarkerDirs {
+	for _, d := range V1VaultMarkerDirs {
 		if fi, err := os.Stat(filepath.Join(resolvedVaultPath, d)); err == nil && fi.IsDir() {
 			return VaultIndexingScopeFull
 		}

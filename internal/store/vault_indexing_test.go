@@ -184,7 +184,7 @@ func TestVaultLayoutEffectiveSoakWarnAfter(t *testing.T) {
 		want    time.Duration
 		wantErr bool
 	}{
-		{"default", "", defaultVaultLayoutSoakWarnAfter, false},
+		{"default", "", DefaultVaultLayoutSoakWarnAfter, false},
 		{"valid", "168h", 168 * time.Hour, false},
 		{"malformed", "thirty days", 0, true},
 		{"negative", "-1h", 0, true},

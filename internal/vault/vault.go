@@ -108,7 +108,7 @@ type Exporter struct {
 	resolveLayout func() string
 
 	// resolveSoakWarnAfter returns the configured "both"-layout soak
-	// window. Nil → defaultVaultSoakWarnAfter (720h / 30 days).
+	// window. Nil → store.DefaultVaultLayoutSoakWarnAfter (720h / 30 days).
 	resolveSoakWarnAfter func() time.Duration
 }
 
@@ -175,16 +175,15 @@ func (e *Exporter) maintainStateAndWarn(layout string) {
 		return
 	}
 
+	pathReset := false
 	if state.VaultPath != e.path {
 		state.ResetLayoutCounters()
 		state.VaultPath = e.path
+		pathReset = true
 	}
 
 	now := time.Now().UTC()
-	changed := state.RecordLayoutFirstSeen(layout, now)
-	// Bookkeeping field updates we want to persist whether or not the
-	// first-seen entry was new — VaultPath above may have been reset.
-	changed = changed || state.VaultPath == e.path
+	changed := state.RecordLayoutFirstSeen(layout, now) || pathReset
 
 	if layout == store.VaultLayoutBoth {
 		t := state.LayoutFirstSeen(store.VaultLayoutBoth)
@@ -221,19 +220,14 @@ func (e *Exporter) maintainStateAndWarn(layout string) {
 // a full Config.
 func (e *Exporter) soakWarnAfter() time.Duration {
 	if e.resolveSoakWarnAfter == nil {
-		return defaultVaultSoakWarnAfter
+		return store.DefaultVaultLayoutSoakWarnAfter
 	}
 	d := e.resolveSoakWarnAfter()
 	if d <= 0 {
-		return defaultVaultSoakWarnAfter
+		return store.DefaultVaultLayoutSoakWarnAfter
 	}
 	return d
 }
-
-// defaultVaultSoakWarnAfter mirrors store.defaultVaultLayoutSoakWarnAfter
-// (kept duplicated rather than exported to avoid widening the store
-// API for one constant; tests pin both values).
-const defaultVaultSoakWarnAfter = 720 * time.Hour
 
 // activeLayout returns the resolved layout mode for this sync, or
 // VaultLayoutBoth when no resolver is configured (safe default).

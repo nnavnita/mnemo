@@ -173,13 +173,7 @@ func (r *Registry) ForUser(username string) (*store.Store, error) {
 			exp.SetLayoutResolver(func() string {
 				return r.CurrentConfig().ResolvedVaultLayout(vp)
 			})
-			exp.SetSoakWarnAfterResolver(func() time.Duration {
-				d, err := r.CurrentConfig().VaultLayout.EffectiveSoakWarnAfter()
-				if err != nil {
-					return 0
-				}
-				return d
-			})
+			exp.SetSoakWarnAfterResolver(r.soakWarnAfterResolver())
 			vaultExp = exp
 		}
 	}
@@ -644,6 +638,40 @@ func (r *Registry) CurrentConfig() store.Config {
 	return r.cfg
 }
 
+// soakWarnAfterResolver returns a closure suitable for
+// vault.Exporter.SetSoakWarnAfterResolver. The closure reads the live
+// config on every call and, on the first malformed value it observes,
+// emits a structured warning so a misconfigured soak window does not
+// silently degrade to the package default. Subsequent calls with the
+// same malformed string stay quiet to avoid log spam at sync cadence;
+// a different malformed value re-arms the warn.
+//
+// mnemo_config validates SoakWarnAfter at write time (see tools.go)
+// so the resolver path is defence-in-depth: users who hand-edit
+// config.json still see the misconfiguration in the daemon log.
+func (r *Registry) soakWarnAfterResolver() func() time.Duration {
+	var (
+		mu         sync.Mutex
+		lastWarned string
+	)
+	return func() time.Duration {
+		raw := r.CurrentConfig().VaultLayout.SoakWarnAfter
+		d, err := r.CurrentConfig().VaultLayout.EffectiveSoakWarnAfter()
+		if err != nil {
+			mu.Lock()
+			fire := raw != lastWarned
+			lastWarned = raw
+			mu.Unlock()
+			if fire {
+				slog.Warn("vault_layout.soak_warn_after malformed; falling back to default",
+					"value", raw, "err", err)
+			}
+			return 0
+		}
+		return d
+	}
+}
+
 // vaultIndexingOptionsFor builds the VaultIndexingOptions struct
 // IngestVaultAnnotations expects, resolving any auto-default scope
 // against the live vault tree (🎯T64.1). Reads the live config under
@@ -824,13 +852,7 @@ func (r *Registry) swapVault(username string, e *userEntry, newPath string) erro
 	exp.SetLayoutResolver(func() string {
 		return r.CurrentConfig().ResolvedVaultLayout(newPath)
 	})
-	exp.SetSoakWarnAfterResolver(func() time.Duration {
-		d, err := r.CurrentConfig().VaultLayout.EffectiveSoakWarnAfter()
-		if err != nil {
-			return 0
-		}
-		return d
-	})
+	exp.SetSoakWarnAfterResolver(r.soakWarnAfterResolver())
 	r.mu.Lock()
 	e.vault = exp
 	vctx := r.startVaultWorkers(username, e)

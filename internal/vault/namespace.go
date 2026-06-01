@@ -5,6 +5,7 @@ package vault
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,27 +50,43 @@ func (e *Exporter) syncMnemoNamespace() error {
 	}
 
 	// MIGRATION.md is write-once. Only create it when v1 dirs are
-	// present AND state.json records no prior write for this vault. A
-	// user who deletes the file is signalling "I have read this; move
-	// on" — state.VaultMigrationDocWritten stays true and we honour
-	// that by not recreating it. Reading and writing state here is
-	// best-effort: failures log and proceed so a state.json problem
-	// never blocks the rest of the sync.
+	// present AND neither the on-disk file nor state.json records a
+	// prior write. A user who deletes the file is signalling "I have
+	// read this; move on" — we honour that by not recreating it. Two
+	// sources of truth gate the write so the contract survives a
+	// state.json that is unhealthy precisely when the contract matters
+	// most (disk full, permission failure on the state write).
+	// Reading and writing state here is best-effort: failures log and
+	// proceed so a state.json problem never blocks the rest of the
+	// sync.
 	v1Dirs := detectV1Dirs(e.path)
 	if len(v1Dirs) > 0 {
 		state, err := store.LoadState()
 		if err != nil {
-			return fmt.Errorf("vault: load state for migration-doc gate: %w", err)
+			slog.Warn("vault: load state for migration-doc gate failed; skipping MIGRATION.md", "err", err)
+			return nil
+		}
+		migPath := filepath.Join(wingDir, migrationDocName)
+		if _, statErr := os.Stat(migPath); statErr == nil {
+			// File already on disk — honour as already-written. Pin the
+			// flag if state.json missed it so future syncs (and the
+			// soak-warn path) see a consistent view.
+			if !state.VaultMigrationDocWritten {
+				state.VaultMigrationDocWritten = true
+				if err := store.WriteState(state); err != nil {
+					slog.Warn("vault: pin migration-doc flag failed", "err", err)
+				}
+			}
+			return nil
 		}
 		if !state.VaultMigrationDocWritten {
-			migPath := filepath.Join(wingDir, migrationDocName)
 			content := renderMigrationDoc(e.path, v1Dirs)
 			if err := os.WriteFile(migPath, []byte(content), 0o644); err != nil {
 				return fmt.Errorf("vault: write _mnemo/MIGRATION.md: %w", err)
 			}
 			state.VaultMigrationDocWritten = true
 			if err := store.WriteState(state); err != nil {
-				return fmt.Errorf("vault: persist migration-doc flag: %w", err)
+				slog.Warn("vault: persist migration-doc flag failed; file written", "err", err)
 			}
 		}
 	}
@@ -79,17 +96,9 @@ func (e *Exporter) syncMnemoNamespace() error {
 // detectV1Dirs returns the subset of v1 marker dirs that exist under
 // vaultPath. Used by the namespace writer (for MIGRATION.md gating)
 // and by the migration-doc tool (to summarise what would be migrated).
-//
-// The list mirrors store.v1VaultMarkerDirs but is duplicated here to
-// avoid coupling the vault package to that unexported symbol. Drift
-// risk is low: the v1 layout is frozen.
 func detectV1Dirs(vaultPath string) []string {
-	candidates := []string{
-		"sessions", "decisions", "memories", "skills", "configs",
-		"plans", "targets", "ci", "prs", "repos",
-	}
 	var present []string
-	for _, d := range candidates {
+	for _, d := range store.V1VaultMarkerDirs {
 		if fi, err := os.Stat(filepath.Join(vaultPath, d)); err == nil && fi.IsDir() {
 			present = append(present, d)
 		}
@@ -258,16 +267,3 @@ func (e *Exporter) WriteMigrationDoc() (string, error) {
 	}
 	return path, nil
 }
-
-// resolveLayoutHooked is a package-level seam used by the exporter's
-// Sync to look up the active layout. Real callers set this from the
-// registry (which reads the live config); tests can override.
-//
-// store import is intentional here even though we only need string
-// constants: keeping them in one place avoids drift if the design
-// adds a fourth layout mode.
-var (
-	_ = store.VaultLayoutV2
-	_ = store.VaultLayoutBoth
-	_ = store.VaultLayoutV1
-)
